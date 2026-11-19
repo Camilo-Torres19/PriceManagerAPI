@@ -3,6 +3,9 @@ const router  = express.Router();
 const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const db      = require('../config/database');
+const { authMiddleware } = require('../middleware/auth');
+
+const ROLES = ['admin', 'preventista'];
 
 // ── POST /api/auth/login ──────────────────────────────────────
 router.post('/login', async (req, res) => {
@@ -45,11 +48,22 @@ router.post('/login', async (req, res) => {
 });
 
 // ── POST /api/auth/register ───────────────────────────────────
-router.post('/register', async (req, res) => {
+// SOLO un administrador autenticado puede crear usuarios.
+router.post('/register', authMiddleware, async (req, res) => {
   try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Solo un administrador puede crear usuarios' });
+    }
+
     const { name, email, password, role = 'preventista', zone = '' } = req.body;
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'Nombre, email y contraseña requeridos' });
+    }
+    if (!ROLES.includes(role)) {
+      return res.status(400).json({ error: 'Rol inválido. Usa: admin o preventista' });
+    }
+    if (String(password).length < 6) {
+      return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
     }
 
     const [existing] = await db.query('SELECT id FROM users WHERE email = ?', [email]);
@@ -63,14 +77,8 @@ router.post('/register', async (req, res) => {
       [name, email, hashedPassword, role, zone]
     );
 
-    const token = jwt.sign(
-      { id: result.insertId, email, role, name },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
+    // No se devuelve token: el admin sigue con su propia sesión.
     res.status(201).json({
-      token,
       user: { id: result.insertId, name, email, role, zone }
     });
   } catch (err) {
@@ -79,7 +87,6 @@ router.post('/register', async (req, res) => {
 });
 
 // ── GET /api/auth/me ──────────────────────────────────────────
-const { authMiddleware } = require('../middleware/auth');
 router.get('/me', authMiddleware, async (req, res) => {
   try {
     const [rows] = await db.query(
