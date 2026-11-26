@@ -14,6 +14,10 @@ app.use('/api/auth',        require('./routes/auth.routes'));
 app.use('/api/products',    require('./routes/products.routes'));
 app.use('/api/promotions',  require('./routes/promotions.routes'));
 app.use('/api/categories',  require('./routes/categories.routes'));
+app.use('/api/clients',     require('./routes/clients.routes'));
+app.use('/api/orders',      require('./routes/orders.routes'));
+app.use('/api/users',       require('./routes/users.routes'));
+app.use('/api/history',     require('./routes/history.routes'));
 
 // ── Health check ──────────────────────────────────────────────
 app.get('/', (req, res) => {
@@ -26,6 +30,10 @@ app.get('/', (req, res) => {
       products:    '/api/products | /api/products/:id | /api/products/:id/price | /api/products/:id/history',
       promotions:  '/api/promotions | /api/promotions/all',
       categories:  '/api/categories',
+      clients:     '/api/clients',
+      orders:      '/api/orders',
+      users:       '/api/users',
+      history:     '/api/history',
     }
   });
 });
