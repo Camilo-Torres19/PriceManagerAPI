@@ -5,12 +5,12 @@ const { authMiddleware, adminMiddleware } = require('../middleware/auth');
 const { sendError, toId } = require('../utils/db-helpers');
 
 // ── GET /api/history — historial de cambios (admin) ───────────
-// ?entity=order|client|product  ?entity_id=  ?limit= (máx 200)
+// ?entity=order|client|product|user  ?entity_id=  ?limit= (máx 200)
 router.get('/', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const where = [];
     const params = [];
-    if (['order', 'client', 'product'].includes(req.query.entity)) {
+    if (['order', 'client', 'product', 'user'].includes(req.query.entity)) {
       where.push('entity = ?');
       params.push(req.query.entity);
     }
