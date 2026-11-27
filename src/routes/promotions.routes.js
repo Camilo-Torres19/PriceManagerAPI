@@ -29,6 +29,8 @@ function validate(body) {
   if (type === 'discount_fixed' && !(value > 0)) {
     return { error: 'El descuento en valor debe ser mayor que cero' };
   }
+  // 2x1 = "lleve 2, pague 1": no usa valor de descuento
+  const finalValue = type === '2x1' ? 0 : value;
 
   const start = body.start_date || null;
   const end   = body.end_date || null;
@@ -46,7 +48,7 @@ function validate(body) {
   ids = [...new Set(ids)];
 
   const description = String(body.description ?? '').trim() || null;
-  return { data: { title, description, type, value, start, end, ids } };
+  return { data: { title, description, type, value: finalValue, start, end, ids } };
 }
 
 // Lee promociones con sus productos. Las fechas salen como 'AAAA-MM-DD' (sin zona horaria)

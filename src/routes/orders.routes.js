@@ -3,7 +3,7 @@ const router  = express.Router();
 const db      = require('../config/database');
 const { authMiddleware, adminMiddleware } = require('../middleware/auth');
 const { withTransaction, logChange, HttpError, sendError, toId, text } = require('../utils/db-helpers');
-const { vigentPromosFor, bestPrice } = require('../utils/pricing');
+const { vigentPromosFor, bestForQty, lineTotal } = require('../utils/pricing');
 
 const isAdmin = (req) => req.user.role === 'admin';
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -25,6 +25,7 @@ const toItem = (i) => ({
   unit_price: num(i.unit_price),
   discount: num(i.discount),
   applied_price: num(i.applied_price),
+  promotion_value: num(i.promotion_value),
   subtotal: num(i.subtotal),
 });
 
@@ -56,69 +57,124 @@ async function checkClient(conn, req, clientId) {
 }
 
 /**
- * Arma las líneas del pedido con precios calculados AQUÍ.
- * keep: líneas anteriores del pedido (al editar). Un producto que ya estaba conserva el precio
- * pactado; los productos nuevos toman el precio y la promoción vigentes hoy.
+ * Unidades comprometidas en pedidos PENDIENTES (todavía no descontadas del stock),
+ * sin contar el pedido que se está editando.
+ * Se llama DESPUÉS de bloquear los productos (FOR UPDATE), así dos pedidos simultáneos
+ * por el mismo producto se atienden uno tras otro.
  */
-async function buildLines(conn, items, keep = new Map()) {
+async function reservedFor(conn, productIds, excludeOrderId = null) {
+  const [rows] = await conn.query(
+    `SELECT i.product_id, SUM(i.quantity) AS qty
+     FROM order_items i JOIN orders o ON o.id = i.order_id
+     WHERE o.status = 'pendiente' AND i.product_id IN (?) AND o.id <> ?
+     GROUP BY i.product_id
+     LOCK IN SHARE MODE`, // lectura con bloqueo: ve lo último guardado (sirve en MySQL y MariaDB)
+    [productIds, excludeOrderId ?? 0]
+  );
+  return new Map(rows.map((r) => [r.product_id, Number(r.qty)]));
+}
+
+/** Redondea a centavos (las columnas DECIMAL tienen 2 decimales) */
+const round2 = (n) => Math.round(n * 100) / 100;
+
+/**
+ * Arma las líneas del pedido con precios calculados AQUÍ.
+ * keep: líneas anteriores del pedido (al editar). Un producto que ya estaba conserva su precio
+ * y su promoción pactados (aunque la promoción ya haya vencido); los productos nuevos toman
+ * el precio y la mejor promoción vigentes hoy para esa cantidad.
+ *
+ * DISPONIBLE = stock − unidades en otros pedidos pendientes (+ lo que este pedido ya
+ * descontó, si estaba confirmado). No se puede pedir más de lo disponible; sí se puede
+ * dejar igual o bajar una cantidad que ya estaba (para corregir pedidos viejos).
+ * order: el pedido que se edita (null al crear).
+ */
+async function buildLines(conn, items, keep = new Map(), order = null) {
   const ids = items.map((i) => i.product_id);
+  // FOR UPDATE: dos pedidos al mismo tiempo no pueden tomar las mismas unidades
   const [prods] = await conn.query(
-    'SELECT id, name, unit, current_price, stock, is_active FROM products WHERE id IN (?)',
+    'SELECT id, name, unit, current_price, stock, is_active FROM products WHERE id IN (?) FOR UPDATE',
     [ids]
   );
   const byId = new Map(prods.map((p) => [p.id, p]));
   const promos = await vigentPromosFor(conn, ids);
+  const reserved = await reservedFor(conn, ids, order?.id);
 
   const lines = [];
   const warnings = [];
+  const shortages = [];
   for (const { product_id, quantity } of items) {
     const p = byId.get(product_id);
     const old = keep.get(product_id);
     if (!p || (!p.is_active && !old)) throw new HttpError(400, `El producto #${product_id} no existe o está inactivo`);
 
-    let unit_price, applied, promo_id, promo_title;
+    let unit_price, subtotal, promo;
     if (old) {
       unit_price = Number(old.unit_price);
-      applied = Number(old.applied_price);
-      promo_id = old.promotion_id;
-      promo_title = old.promotion_title;
+      if (old.promotion_type) {
+        // Promoción pactada: se vuelve a aplicar con la cantidad nueva
+        promo = {
+          id: old.promotion_id,
+          title: old.promotion_title,
+          type: old.promotion_type,
+          discount_value: Number(old.promotion_value ?? 0),
+        };
+        subtotal = lineTotal(unit_price, quantity, promo);
+      } else {
+        // Pedidos anteriores a esta versión: se respeta el precio unitario pactado
+        promo = old.promotion_id
+          ? { id: old.promotion_id, title: old.promotion_title, type: null, discount_value: null }
+          : null;
+        subtotal = Number(old.applied_price) * quantity;
+      }
     } else {
       unit_price = Number(p.current_price);
-      const best = bestPrice(unit_price, promos.get(product_id));
-      applied = best.applied;
-      promo_id = best.promo?.id ?? null;
-      promo_title = best.promo?.title ?? null;
+      ({ subtotal, promo } = bestForQty(unit_price, quantity, promos.get(product_id)));
     }
+
+    const applied = round2(subtotal / quantity);
     lines.push({
       product_id,
       product_name: old?.product_name ?? p.name,
       unit: old?.unit ?? p.unit,
       quantity,
       unit_price,
-      discount: unit_price - applied,
+      discount: round2(unit_price - applied),
       applied_price: applied,
-      promotion_id: promo_id,
-      promotion_title: promo_title,
-      subtotal: applied * quantity,
+      promotion_id: promo?.id ?? null,
+      promotion_title: promo?.title ?? null,
+      promotion_type: promo?.type ?? null,
+      promotion_value: promo?.discount_value ?? null,
+      subtotal,
     });
-    if (quantity > p.stock) {
-      warnings.push({ product_id, name: p.name, stock: p.stock, quantity });
+    const oldQty = old ? Number(old.quantity) : 0;
+    const available =
+      p.stock - (reserved.get(product_id) ?? 0) + (order?.status === 'confirmado' ? oldQty : 0);
+    if (quantity > available && quantity > oldQty) {
+      shortages.push({ product_id, name: p.name, available: Math.max(0, available), quantity });
     }
   }
-  const totals = {
-    subtotal: lines.reduce((s, l) => s + l.unit_price * l.quantity, 0),
-    discount_total: lines.reduce((s, l) => s + l.discount * l.quantity, 0),
-    total: lines.reduce((s, l) => s + l.subtotal, 0),
-  };
+  if (shortages.length > 0) {
+    throw new HttpError(
+      409,
+      'No hay suficiente disponible: ' +
+        shortages.map((s) => `${s.name} (pides ${s.quantity}, quedan ${s.available})`).join('; '),
+      { shortages }
+    );
+  }
+  const total = lines.reduce((s, l) => s + l.subtotal, 0);
+  const full = lines.reduce((s, l) => s + l.unit_price * l.quantity, 0);
+  const totals = { subtotal: full, discount_total: full - total, total };
   return { lines, warnings, totals };
 }
 
 async function insertLines(conn, orderId, lines) {
   await conn.query(
     `INSERT INTO order_items (order_id, product_id, product_name, unit, quantity, unit_price, discount,
-                              applied_price, promotion_id, promotion_title, subtotal) VALUES ?`,
+                              applied_price, promotion_id, promotion_title, promotion_type, promotion_value,
+                              subtotal) VALUES ?`,
     [lines.map((l) => [orderId, l.product_id, l.product_name, l.unit, l.quantity, l.unit_price,
-                       l.discount, l.applied_price, l.promotion_id, l.promotion_title, l.subtotal])]
+                       l.discount, l.applied_price, l.promotion_id, l.promotion_title,
+                       l.promotion_type, l.promotion_value, l.subtotal])]
   );
 }
 
@@ -196,7 +252,15 @@ router.get('/', authMiddleware, async (req, res) => {
     }
     const [rows] = await db.query(
       `SELECT o.*, c.name AS client_name, u.name AS preventista_name,
-              (SELECT COUNT(*) FROM order_items i WHERE i.order_id = o.id) AS items_count
+              (SELECT COUNT(*) FROM order_items i WHERE i.order_id = o.id) AS items_count,
+              (o.status = 'pendiente' AND EXISTS (
+                 SELECT 1 FROM order_items i JOIN products p ON p.id = i.product_id
+                 WHERE i.order_id = o.id
+                   AND i.quantity > p.stock - (
+                     SELECT COALESCE(SUM(i2.quantity), 0)
+                     FROM order_items i2 JOIN orders o2 ON o2.id = i2.order_id
+                     WHERE o2.status = 'pendiente' AND o2.id <> o.id AND i2.product_id = i.product_id))
+              ) AS stock_issue
        FROM orders o
        JOIN clients c ON c.id = o.client_id
        JOIN users u   ON u.id = o.preventista_id
@@ -205,7 +269,7 @@ router.get('/', authMiddleware, async (req, res) => {
        LIMIT 300`,
       params
     );
-    res.json(rows.map(toOrder));
+    res.json(rows.map((r) => ({ ...toOrder(r), stock_issue: Boolean(r.stock_issue) })));
   } catch (err) {
     sendError(res, err);
   }
@@ -223,7 +287,20 @@ router.get('/:id', authMiddleware, async (req, res) => {
        FROM clients c, users u WHERE c.id = ? AND u.id = ?`,
       [order.client_id, order.preventista_id]
     );
-    res.json({ ...toOrder(order), ...extra, items: items.map(toItem) });
+    let lines = items.map(toItem);
+    if (order.status === 'pendiente' && lines.length > 0) {
+      const ids = lines.map((i) => i.product_id);
+      const [prods] = await db.query('SELECT id, stock FROM products WHERE id IN (?)', [ids]);
+      const stock = new Map(prods.map((p) => [p.id, p.stock]));
+      const reserved = await reservedFor(db, ids, order.id);
+      lines = lines.map((i) => {
+        const s = stock.get(i.product_id) ?? 0;
+        const r = reserved.get(i.product_id) ?? 0;
+        // available: lo que queda para ESTE pedido (stock − otros pendientes)
+        return { ...i, stock: s, reserved_others: r, available: s - r, short: i.quantity > s - r };
+      });
+    }
+    res.json({ ...toOrder(order), ...extra, items: lines });
   } catch (err) {
     sendError(res, err);
   }
@@ -277,7 +354,7 @@ router.put('/:id', authMiddleware, async (req, res) => {
       await checkClient(conn, req, clientId);
 
       const keep = new Map(oldItems.map((i) => [i.product_id, i]));
-      const { lines, warnings, totals } = await buildLines(conn, items, keep);
+      const { lines, warnings, totals } = await buildLines(conn, items, keep, order);
 
       // Si ya estaba confirmado, el stock se devuelve y se vuelve a descontar con las cantidades nuevas
       if (order.status === 'confirmado') {

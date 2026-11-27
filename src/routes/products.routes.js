@@ -6,9 +6,12 @@ const { withTransaction, logChange, HttpError, sendError, toId, text } = require
 
 // base_price es el PRECIO DE COSTO: solo lo ve el admin
 const isAdmin = (req) => req.user.role === 'admin';
+// reserved: unidades en pedidos pendientes; available: lo que de verdad se puede vender
 const hideCost = (req, row) => {
-  if (isAdmin(req)) return row;
-  const { base_price, ...rest } = row;
+  const reserved = Number(row.reserved ?? 0);
+  const full = { ...row, reserved, available: row.stock - reserved };
+  if (isAdmin(req)) return full;
+  const { base_price, ...rest } = full;
   return rest;
 };
 
@@ -50,7 +53,9 @@ router.get('/', authMiddleware, async (req, res) => {
   try {
     const { category, search } = req.query;
     let sql = `
-      SELECT p.*, c.name AS category_name
+      SELECT p.*, c.name AS category_name,
+             (SELECT COALESCE(SUM(i.quantity), 0) FROM order_items i JOIN orders o ON o.id = i.order_id
+              WHERE o.status = 'pendiente' AND i.product_id = p.id) AS reserved
       FROM products p
       LEFT JOIN categories c ON p.category_id = c.id
       WHERE p.is_active = 1
@@ -79,7 +84,9 @@ router.get('/', authMiddleware, async (req, res) => {
 router.get('/:id', authMiddleware, async (req, res) => {
   try {
     const [rows] = await db.query(
-      `SELECT p.*, c.name AS category_name
+      `SELECT p.*, c.name AS category_name,
+             (SELECT COALESCE(SUM(i.quantity), 0) FROM order_items i JOIN orders o ON o.id = i.order_id
+              WHERE o.status = 'pendiente' AND i.product_id = p.id) AS reserved
        FROM products p
        LEFT JOIN categories c ON p.category_id = c.id
        WHERE p.id = ?`, [req.params.id]
